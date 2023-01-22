@@ -7,9 +7,9 @@ import shutil
 import tempfile
 from distutils.core import setup
 
-from .Dependencies import cythonize, extended_iglob
-from ..Utils import is_package_dir
-from ..Compiler import Options
+from Cython.Build.Dependencies import cythonize, extended_iglob
+from Cython.Utils import is_package_dir
+from Cython.Compiler import Options
 
 try:
     import multiprocessing
@@ -124,7 +124,7 @@ def run_distutils(args):
 
 def create_args_parser():
     from argparse import ArgumentParser, RawDescriptionHelpFormatter
-    from ..Compiler.CmdLine import ParseDirectivesAction, ParseOptionsAction, ParseCompileTimeEnvAction
+    from Cython.Compiler.CmdLine import ParseDirectivesAction, ParseOptionsAction, ParseCompileTimeEnvAction
 
     parser = ArgumentParser(
         formatter_class=RawDescriptionHelpFormatter,
