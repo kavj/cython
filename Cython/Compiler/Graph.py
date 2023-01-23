@@ -3,17 +3,96 @@ import operator
 
 import Cython.Compiler.Nodes as nodes
 import Cython.Compiler.ExprNodes as exprs
-from Cython.Compiler.ModuleNode import ModuleNode
 from Cython.Compiler.Visitor import TreeVisitor
+from Cython.Compiler.ModuleNode import ModuleNode
 import networkx as nx
-
 
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from typing import List, Optional
+from typing import List, Optional, Tuple, Union
+
+
+class expr_matcher:
+    """
+    Cython uses nodes that are not easily rendered hashable. The work-around is to do an exhaustive comparison
+    and cache relationships where ids are known to be a match.
+
+    This is meant to be used with atomic expr nodes, which should not be mutated.
+
+    Note: needed for value tracking..
+    """
+
+    def __init__(self):
+        self.known_matches = set()
+        self.non_matches = set()
+        self.negated_matches = set()
+        self.negated_non_matches = set()
+
+    def check_match(self, a: exprs.AtomicExprNode, b: exprs.AtomicExprNode):
+        return frozenset((id(a), id(b))) in self.known_matches
+
+    def check_non_match(self, a: exprs.AtomicExprNode, b: exprs.AtomicExprNode):
+        return frozenset((id(a), id(b))) in self.non_matches
+
+    def compute_negated_match(self, a: exprs.AtomicExprNode, b: exprs.AtomicExprNode):
+        if isinstance(a, exprs.ConstNode) and isinstance(b, exprs.ConstNode):
+            # catch and optimize this case
+            pass
+        if isinstance(a, exprs.NotNode):
+            if self.compute_match(a.operand, b):
+                self.insert_negated_match(a, b)
+                return True
+        if isinstance(b, exprs.NotNode):
+            if self.compute_match(b.operand, a):
+                self.insert_negated_match(a, b)
+                return True
+        self.insert_negated_non_match(a, b)
+        return False
+
+    def insert_match(self, a: exprs.AtomicExprNode, b: exprs.AtomicExprNode):
+        self.known_matches.add(frozenset((id(a), id(b))))
+
+    def insert_non_match(self, a: exprs.AtomicExprNode, b: exprs.AtomicExprNode):
+        self.non_matches.add(frozenset((id(a), id(b))))
+
+    def insert_negated_match(self, a: exprs.AtomicExprNode, b: exprs.AtomicExprNode):
+        self.negated_matches.add(frozenset((id(a), id(b))))
+
+    def insert_negated_non_match(self, a: exprs.AtomicExprNode, b: exprs.AtomicExprNode):
+        self.negated_non_matches.add(frozenset((id(a), id(b))))
+
+    def compute_match(self, a: exprs.AtomicExprNode, b: exprs.AtomicExprNode):
+        if isinstance(a, exprs.NameNode):
+            if isinstance(b, exprs.NameNode):
+                if a.name == b.name:
+                    self.insert_match(a, b)
+                    return True
+            self.insert_non_match(a, b)
+            return False
+        elif isinstance(a, exprs.ConstNode):
+            if isinstance(b, exprs.ConstNode):
+                if a.value == b.value:
+                    self.insert_match(a, b)
+                    return True
+            self.insert_non_match(a, b)
+            return False
+        # If b matches one of the passed types, then it can't be a match
+        elif isinstance(b, (exprs.NameNode, exprs.ConstNode)):
+            self.insert_non_match(a, b)
+            return False
+        if type(a) != type(b):
+            self.insert_non_match(a, b)
+            return False
+        subexpr_nodes_a = a.subexpr_nodes()
+        subexpr_nodes_b = b.subexpr_nodes()
+        if len(subexpr_nodes_a) != len(subexpr_nodes_b):
+            # Not sure if this can happen without bugs.. maybe log a warning?
+            self.insert_non_match(a, b)
+            return False
+        return all(self.compute_match(subexpr_a, subexpr_b) for (subexpr_a, subexpr_b) in zip(subexpr_nodes_a, subexpr_nodes_b))
 
 
 def sequence_block_intervals(stmts: List[nodes.StatNode]):
@@ -42,6 +121,7 @@ class BasicBlock:
     statements: List[nodes.StatNode]
     label: int  # useful in case going by statement is too verbose
     depth: int
+    predicate: Optional[exprs.AtomicExprNode]
 
     @property
     def first(self) -> Optional[nodes.StatNode]:
@@ -174,17 +254,17 @@ class CFGBuilder:
     def depth(self):
         return len(self.loop_entry_points)
 
-    def create_block(self, stmts: List[nodes.StatNode], start: int, stop: int, depth: int):
+    def create_block(self, stmts: List[nodes.StatNode], start: int, stop: int, depth: int, predicate: Optional[exprs.AtomicExprNode]):
         label = next(self.labeler)
         assert 0 <= start <= stop
         if start == 0:
             if stop == len(stmts):
                 # just wrap the statement list
-                block = BasicBlock(stmts.copy(), label, depth)
+                block = BasicBlock(stmts.copy(), label, depth, predicate)
             else:
                 # split prefix
                 interval = stmts[:stop]
-                block = BasicBlock(interval, label, depth)
+                block = BasicBlock(interval, label, depth, predicate)
         else:
             if start < stop:
                 pos = stmts[start].pos
@@ -196,7 +276,7 @@ class CFGBuilder:
                 else:
                     pos = stmts[-1].pos
                 interval = []
-            block = BasicBlock(interval, label, depth)
+            block = BasicBlock(interval, label, depth, predicate)
         self.graph.graph.add_node(block)
         return block
 
@@ -205,7 +285,7 @@ class CFGBuilder:
         label = next(self.labeler)
         # this ensures blocks are consistent, even though we need to invent a fake statement list here
         entry = [entry_stmt]
-        block = BasicBlock(entry, label, 0)
+        block = BasicBlock(entry, label, 0, None)
         self.graph.graph.add_node(block)
         self.graph.entry_block = block
 
@@ -257,11 +337,46 @@ def matches_while_true(node: nodes.StatNode):
     return False
 
 
-def build_graph_recursive(statements: List[nodes.StatNode], builder: CFGBuilder, entry_point: BasicBlock):
+def matches_negated(a: exprs.AtomicExprNode, b: exprs.AtomicExprNode):
+    pass
+
+def and_predicates(a: Union[exprs.AtomicExprNode, Tuple[exprs.AtomicExprNode, ...]], b: exprs.AtomicExprNode):
+
+    if isinstance(a, tuple):
+        pass
+    else:
+        pass
+
+
+def or_predicates(a: exprs.AtomicExprNode, b: exprs.AtomicExprNode, pos):
+    """
+    This should correctly set up an "OR" node with folding if possible.
+    It's needed to determine explicit predication.
+    """
+    return ()
+
+
+def build_graph_recursive(statements: List[nodes.StatNode], builder: CFGBuilder, entry_point: BasicBlock, predicate: Optional[exprs.AtomicExprNode]):
+    """
+    This was adapted somewhat..
+
+    It now receives a predicate, corresponding to the path entry that brought us here. This can be a more complicated expression than the one that appears in source,
+    eg.
+    if a > b:
+        ...
+    else:
+        ...
+
+    would have corresponding predicates
+
+    1: a > b
+    0: not (a > b)
+    """
     prior_block = entry_point
     deferrals = []  # last_block determines if we have deferrals to this one
     for start, stop in sequence_block_intervals(statements):
-        block = builder.create_block(statements, start, stop, builder.depth)
+        # TODO: we actually need to
+        block = builder.create_block(statements, start, stop, builder.depth, None)
         if prior_block is entry_point:
             builder.add_edge(entry_point, block)
         elif prior_block.is_branch_entry_block:
@@ -282,7 +397,13 @@ def build_graph_recursive(statements: List[nodes.StatNode], builder: CFGBuilder,
             loop_header_stmt = statements[start]
             with builder.enclosing_loop(block):
                 body = loop_header_stmt.body.stats
-                last_interior_block = build_graph_recursive(body, builder, block)
+                first = block.first
+                if isinstance(first, nodes.WhileStatNode):
+                    if predicate is None:
+                        predicate = first.condition
+                    else:
+                        predicate = make_and()
+                last_interior_block = build_graph_recursive(body, builder, block, predicate)
                 if last_interior_block.unterminated:
                     builder.add_edge(last_interior_block, block)
         elif block.is_branch_entry_block:
@@ -291,12 +412,12 @@ def build_graph_recursive(statements: List[nodes.StatNode], builder: CFGBuilder,
             if_stmt = statements[start]
             if_body = if_stmt.if_branch
             else_body = if_stmt.else_branch
-            if_exit_block = build_graph_recursive(if_body, builder, block)
+            if_exit_block = build_graph_recursive(if_body, builder, block, predicate)
             # patch initial entry point
             if_entry_block, = builder.graph.successors(block)
             if if_exit_block.unterminated:
                 branch_exit_points.append(if_exit_block)
-            else_exit_block = build_graph_recursive(else_body, builder, block)
+            else_exit_block = build_graph_recursive(else_body, builder, block, predicate)
             for s in builder.graph.successors(block):
                 assert isinstance(s, BasicBlock)
                 if s is not if_entry_block:
@@ -344,7 +465,7 @@ def build_graph(entry_point: nodes.ParallelRangeNode) -> FlowGraph:
     builder = CFGBuilder()
     builder.insert_entry_block(entry_point)
 
-    build_graph_recursive(entry_point.body.stats, builder, builder.entry_block)
+    build_graph_recursive(entry_point.body.stats, builder, builder.entry_block, None)
 
     # Now clean up the graph
     for loop_header, continue_blocks in builder.continue_map.items():
