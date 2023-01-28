@@ -1,5 +1,6 @@
 import itertools
 import operator
+import typing
 
 import Cython.Compiler.Nodes as nodes
 import Cython.Compiler.ExprNodes as exprs
@@ -10,6 +11,7 @@ import networkx as nx
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import singledispatchmethod
 from pathlib import Path
 
 from typing import List, Optional, Tuple, Union
@@ -17,8 +19,8 @@ from typing import List, Optional, Tuple, Union
 
 class expr_matcher:
     """
-    Cython uses nodes that are not easily rendered hashable. The work-around is to do an exhaustive comparison
-    and cache relationships where ids are known to be a match.
+    Cython uses nodes that are not easily rendered hashable. This is bolted on to allow hashing, specifically
+    when we
 
     This is meant to be used with atomic expr nodes, which should not be mutated.
 
@@ -30,6 +32,12 @@ class expr_matcher:
         self.non_matches = set()
         self.negated_matches = set()
         self.negated_non_matches = set()
+
+
+
+    def compute_expr_hash(self, expr: typing.Type[exprs.AtomicExprNode]):
+        if not expr.subexprs:
+            return
 
     def check_match(self, a: exprs.AtomicExprNode, b: exprs.AtomicExprNode):
         return frozenset((id(a), id(b))) in self.known_matches
@@ -116,12 +124,16 @@ def sequence_block_intervals(stmts: List[nodes.StatNode]):
     yield block_start, block_last + 1
 
 
-@dataclass(frozen=True)
+@dataclass
 class BasicBlock:
+    # Block
     statements: List[nodes.StatNode]
     label: int  # useful in case going by statement is too verbose
     depth: int
-    predicate: Optional[exprs.AtomicExprNode]
+    # predicate consists of an optional expression and a boolean qualifier, which indicates whether it is flipped
+    # Any not qualifiers should be stripped and placed in the second operand. This helps compare predicate
+    # sequences for redundant branches or those that claim all remaining conditions, when this is actually decidable.
+    predicate: Tuple[Union[exprs.AtomicExprNode, bool], bool]
 
     @property
     def first(self) -> Optional[nodes.StatNode]:
@@ -340,12 +352,8 @@ def matches_while_true(node: nodes.StatNode):
 def matches_negated(a: exprs.AtomicExprNode, b: exprs.AtomicExprNode):
     pass
 
-def and_predicates(a: Union[exprs.AtomicExprNode, Tuple[exprs.AtomicExprNode, ...]], b: exprs.AtomicExprNode):
-
-    if isinstance(a, tuple):
-        pass
-    else:
-        pass
+def and_predicates(a: Tuple[Union[exprs.AtomicExprNode, bool], bool], b: Tuple[Union[exprs.AtomicExprNode, bool], bool]):
+    return ()
 
 
 def or_predicates(a: exprs.AtomicExprNode, b: exprs.AtomicExprNode, pos):
@@ -402,13 +410,22 @@ def build_graph_recursive(statements: List[nodes.StatNode], builder: CFGBuilder,
                     if predicate is None:
                         predicate = first.condition
                     else:
-                        predicate = make_and()
+                        predicate = and_predicates(block.predicate, (predicate, False))
                 last_interior_block = build_graph_recursive(body, builder, block, predicate)
                 if last_interior_block.unterminated:
                     builder.add_edge(last_interior_block, block)
         elif block.is_branch_entry_block:
-            raise NotImplementedError('Still converting branch types..')
             branch_exit_points = []
+            branch_entry = block.first
+            for clause in branch_entry.if_clauses:
+                pass
+            if branch_entry.else_clause is None:
+                # empty block here
+
+                pass
+            else:
+                #
+                pass
             if_stmt = statements[start]
             if_body = if_stmt.if_branch
             else_body = if_stmt.else_branch
