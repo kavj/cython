@@ -4,6 +4,7 @@ import itertools
 from time import time
 
 from . import Errors
+from . import Graph
 from . import DebugFlags
 from . import Options
 from .Errors import CompileError, InternalError, AbortError
@@ -188,6 +189,8 @@ def create_pipeline(context, mode, exclude_classes=()):
         TrackNumpyAttributes(),
         InterpretCompilerDirectives(context, context.compiler_directives),
         ParallelRangeTransform(context),
+        PrintTree(),
+        Graph.SubgraphCreation(),
         WithTransform(),
         AdjustDefByDirectives(context),
         _align_function_definitions,

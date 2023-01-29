@@ -10,7 +10,7 @@ import networkx as nx
 
 from collections import defaultdict
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import singledispatchmethod
 from pathlib import Path
 
@@ -127,13 +127,16 @@ def sequence_block_intervals(stmts: List[nodes.StatNode]):
 @dataclass
 class BasicBlock:
     # Block
-    statements: List[nodes.StatNode]
     label: int  # useful in case going by statement is too verbose
     depth: int
     # predicate consists of an optional expression and a boolean qualifier, which indicates whether it is flipped
     # Any not qualifiers should be stripped and placed in the second operand. This helps compare predicate
     # sequences for redundant branches or those that claim all remaining conditions, when this is actually decidable.
-    predicate: Tuple[Union[exprs.AtomicExprNode, bool], bool]
+    predicate: Union[exprs.AtomicExprNode, bool] = True
+    statements: List[nodes.StatNode] = field(default_factory=list)
+
+    def append(self, stmt: nodes.StatNode):
+        self.statements.append(stmt)
 
     @property
     def first(self) -> Optional[nodes.StatNode]:
@@ -199,6 +202,15 @@ class FlowGraph:
         self.graph = nx.DiGraph()
         self.entry_block = None
 
+    def add_node(self, block: BasicBlock, parents: List[BasicBlock]):
+        self.graph.add_node(block)
+        for p in parents:
+            self.graph.add_edge(p, block)
+
+    def add_entry_block(self, entry_block: BasicBlock):
+        assert self.entry_block is None
+        self.entry_block = entry_block
+
     @property
     def func_name(self):
         return self.entry_block.first.name
@@ -230,22 +242,22 @@ class FlowGraph:
             return self.graph.out_degree()
         return self.graph.out_degree(block)
 
+    def add_edge(self, source: BasicBlock, sink: BasicBlock):
+        self.graph.add_edge(source, sink)
+
     def remove_edge(self, source: BasicBlock, sink: BasicBlock):
         self.graph.remove_edge(source, sink)
 
 
-class CFGBuilder:
-
+class CFGBuilderVisitor(TreeVisitor):
     def __init__(self, start_from=0):
-        self.loop_entry_points = []
-        self.continue_map = defaultdict(list)
-        self.break_map = defaultdict(list)
-        self.scope_entry_blocks = {}  # map of header to initial entry blocks
-        self.scope_exit_blocks = {}  # map of header to exit
-        self.return_blocks = []
+        super().__init__()
+        self.entry_points = []
         self.labeler = itertools.count(start_from)
         self.graph = FlowGraph()
         self.counter = itertools.count()
+        self.current_block = None
+        self.loop_depth = 0
 
     @property
     def entry_block(self):
@@ -255,50 +267,162 @@ class CFGBuilder:
     def next_label(self):
         return next(self.counter)
 
+    def enter_loop(self, block: BasicBlock):
+        assert block.is_loop_block
+        self.loop_depth += 1
+        self.entry_points.append((block,[]))
+
+    def exit_loop(self):
+        block, deferrals = self.entry_points.pop()
+        assert block.is_loop_block
+        self.loop_depth -= 1
+        return block, deferrals
+
     @contextmanager
-    def enclosing_loop(self, node: BasicBlock):
-        assert node.is_loop_block
-        self.loop_entry_points.append(node)
+    def branch_scope(self, block: BasicBlock):
+        self.entry_points.append(block)
         yield
-        self.loop_entry_points.pop()
+        self.entry_points.pop()
 
-    @property
-    def depth(self):
-        return len(self.loop_entry_points)
-
-    def create_block(self, stmts: List[nodes.StatNode], start: int, stop: int, depth: int, predicate: Optional[exprs.AtomicExprNode]):
-        label = next(self.labeler)
-        assert 0 <= start <= stop
-        if start == 0:
-            if stop == len(stmts):
-                # just wrap the statement list
-                block = BasicBlock(stmts.copy(), label, depth, predicate)
-            else:
-                # split prefix
-                interval = stmts[:stop]
-                block = BasicBlock(interval, label, depth, predicate)
+    def add_block(self, node: Optional[nodes.StatNode] = None, predicate: Optional[exprs.AtomicExprNode] = None):
+        block = BasicBlock(self.next_label, self.loop_depth, predicate=predicate)
+        if self.entry_block is None:
+            self.graph.add_entry_block(block)
         else:
-            if start < stop:
-                pos = stmts[start].pos
-                interval = stmts[start:stop]
-            else:
-                if start < len(stmts):
-                    # not sure how this would happen..
-                    pos = stmts[start].pos
-                else:
-                    pos = stmts[-1].pos
-                interval = []
-            block = BasicBlock(interval, label, depth, predicate)
-        self.graph.graph.add_node(block)
+            parents = [] if self.current_block is None else [self.current_block]
+            self.graph.add_node(block, parents)
+        if node is not None:
+            block.append(node)
+        self.current_block = block
         return block
 
-    def insert_entry_block(self, entry_stmt: nodes.ParallelRangeNode):
-        assert self.entry_block is None
-        label = next(self.labeler)
-        # this ensures blocks are consistent, even though we need to invent a fake statement list here
-        entry = [entry_stmt]
-        block = BasicBlock(entry, label, 0, None)
+    def visit_ParallelRangeNode(self, node: nodes.ParallelRangeNode):
+        header_block = self.add_block(node)
+        self.enter_loop(header_block)
+        self.visit(node.body)
+        if not self.current_block.terminated:
+            # make back edge
+            self.graph.add_edge(self.current_block, header_block)
+        header, deferrals = self.exit_loop()
+        assert header is header_block
+        exit_block = self.add_block()
+        self.graph.add_edge(header_block, exit_block)
+        for d in deferrals:
+            self.graph.add_edge(d, exit_block)
+
+    def visit_IfStatNode(self, node: nodes.IfStatNode):
+        header_block = self.add_block(node)
+        deferrals = []
+        for branch in node.if_clauses:
+            self.current_block = header_block
+            self.visit(branch)
+            if self.current_block.unterminated:
+                deferrals.append(self.current_block)
+        if node.else_clause is not None:
+            self.current_block = header_block
+            self.visit(node.else_clause)
+            if self.current_block.unterminated:
+                deferrals.append(self.current_block)
+        exit_block = self.add_block()
+        for d in deferrals:
+            self.graph.add_edge(d, exit_block)
+
+    def visit_IfClauseNode(self, node: nodes.IfClauseNode):
+        self.add_block(predicate=node.condition)
+        self.visit(node.body)
+
+    def visit_ForInStatNode(self):
+        header_block = self.add_block()
+        pass
+
+    def visit_WhileStatNode(self):
+        pass
+
+    def visit_BreakStatNode(self):
+        pass
+
+    def visit_ReturnStatNode(self):
+        pass
+
+    def visit_StatNode(self):
+        pass
+
+    def visit_StatListNode(self):
+        pass
+
+
+
+class CFGBuilder:
+
+    def __init__(self, start_from=0):
+        self.entry_points = []
+        # self.pending_break_targets = []
+        self.labeler = itertools.count(start_from)
+        self.graph = None
+        self.counter = itertools.count()
+        self.current_block = None
+        self.loop_depth = 0
+
+    @property
+    def entry_block(self):
+        return self.graph.entry_block
+
+    @property
+    def next_label(self):
+        return next(self.counter)
+
+    def add_continue(self):
+        for block, _ in reversed(self.entry_points):
+            if block.is_loop_block:
+                self.add_edge(self.current_block, block)
+                return
+
+    def add_break(self):
+        for block, deferrals in reversed(self.entry_points):
+            if block.is_loop_block:
+                deferrals.append(self.current_block)
+                return
+
+    def add_branch_deferral(self, block: BasicBlock):
+        entry_point, deferrals = self.entry_points[-1]
+        assert entry_point.is_branch_block
+        deferrals.append(block)
+
+    def leave_scope(self):
+        block, deferrals = self.entry_points.pop()
+        current_block = self.current_block
+        assert block.is_loop_block
+        if block.is_loop_block:
+            if current_block.unterminated:
+                self.add_edge(current_block, block)
+            self.loop_depth -= 1
+        # declares break targets as parents of exit
+        self.create_block(predicate=True, parents=deferrals)
+
+    def create_block(self, predicate: Union[exprs.AtomicExprNode, bool], parents: List[BasicBlock]):
+        if predicate is None:
+            predicate = True
+        block = BasicBlock(self.next_label, self.loop_depth, predicate)
         self.graph.graph.add_node(block)
+        for p in parents:
+            self.add_edge(p, block)
+        self.current_block = block
+        return block
+
+    def add_statement(self, stmt: nodes.StatNode):
+        if not self.current_block.is_terminated:
+            self.current_block.append(stmt)
+            if isinstance(stmt, nodes.ContinueStatNode):
+                self.add_continue()
+            elif isinstance(stmt, nodes.BreakStatNode):
+                self.add_break()
+
+    def add_entry_block(self, entry_stmt: Union[nodes.ParallelRangeNode, nodes.ForInStatNode, nodes.IfStatNode, nodes.WhileStatNode], parents: List[BasicBlock]):
+        block = self.create_block(predicate=True, parents=parents)
+        block.append(entry_stmt)
+        self.entry_points.append((block, []))
+        if block.is_loop_block:
+            self.loop_depth += 1
         self.graph.entry_block = block
 
     def add_edge(self, source: BasicBlock, sink: BasicBlock):
@@ -307,38 +431,6 @@ class CFGBuilder:
             raise ValueError(msg)
         assert source is not sink
         self.graph.graph.add_edge(source, sink)
-
-    def register_scope_entry_point(self, source: BasicBlock, sink: BasicBlock):
-        assert source.is_entry_point
-        self.add_edge(source, sink)
-        self.scope_entry_blocks[source].append(sink)
-
-    def register_scope_exit_point(self, source: BasicBlock, sink: BasicBlock):
-        assert source.is_branch_entry_block or source.is_loop_block
-        assert source not in self.scope_exit_blocks
-        self.scope_exit_blocks[source] = sink
-
-    def register_continue(self, block: BasicBlock):
-        if not self.loop_entry_points:
-            msg = f'Break: "{block.last}" encountered outside of loop.'
-            raise ValueError(msg)
-        self.continue_map[self.loop_entry_points[-1]].append(block)
-
-    def register_break(self, block: BasicBlock):
-        if not self.loop_entry_points:
-            msg = f'Break: "{block.last}" encountered outside of loop.'
-            raise ValueError(msg)
-        self.break_map[self.loop_entry_points[-1]].append(block)
-
-    def register_block_terminator(self, block: BasicBlock):
-        last = block.last
-        if last is not None:
-            if isinstance(last, nodes.ContinueStatNode):
-                self.register_continue(block)
-            elif isinstance(last, nodes.BreakStatNode):
-                self.register_break(block)
-            elif isinstance(last, nodes.ReturnStatNode):
-                self.return_blocks.append(block)
 
 
 def matches_while_true(node: nodes.StatNode):
@@ -364,91 +456,12 @@ def or_predicates(a: exprs.AtomicExprNode, b: exprs.AtomicExprNode, pos):
     return ()
 
 
-def build_graph_recursive(statements: List[nodes.StatNode], builder: CFGBuilder, entry_point: BasicBlock, predicate: Optional[exprs.AtomicExprNode]):
-    """
-    This was adapted somewhat..
-
-    It now receives a predicate, corresponding to the path entry that brought us here. This can be a more complicated expression than the one that appears in source,
-    eg.
-    if a > b:
-        ...
+def iter_statements(node: Union[nodes.StatNode, nodes.StatListNode], reverse=False):
+    if isinstance(node, nodes.StatListNode):
+        stats = node.stats
     else:
-        ...
-
-    would have corresponding predicates
-
-    1: a > b
-    0: not (a > b)
-    """
-    prior_block = entry_point
-    deferrals = []  # last_block determines if we have deferrals to this one
-    for start, stop in sequence_block_intervals(statements):
-        # TODO: we actually need to
-        block = builder.create_block(statements, start, stop, builder.depth, None)
-        if prior_block is entry_point:
-            builder.add_edge(entry_point, block)
-        elif prior_block.is_branch_entry_block:
-            # If we have blocks exiting a branch, which do not contain a terminating statement
-            # then add incoming edges to this block
-            for d in deferrals.pop():
-                builder.add_edge(d, block)
-        else:
-            if prior_block.is_loop_block:
-                # indicate loop exit block so that breaks can be connected
-                builder.register_scope_exit_point(prior_block, block)
-            # loop or normal must add edge
-            if prior_block.unterminated and not matches_while_true(prior_block.last):
-                builder.add_edge(prior_block, block)
-        # buffering taken care of by sequence block
-        if block.is_loop_block:
-            # need to preserve entry point info here..
-            loop_header_stmt = statements[start]
-            with builder.enclosing_loop(block):
-                body = loop_header_stmt.body.stats
-                first = block.first
-                if isinstance(first, nodes.WhileStatNode):
-                    if predicate is None:
-                        predicate = first.condition
-                    else:
-                        predicate = and_predicates(block.predicate, (predicate, False))
-                last_interior_block = build_graph_recursive(body, builder, block, predicate)
-                if last_interior_block.unterminated:
-                    builder.add_edge(last_interior_block, block)
-        elif block.is_branch_entry_block:
-            branch_exit_points = []
-            branch_entry = block.first
-            for clause in branch_entry.if_clauses:
-                pass
-            if branch_entry.else_clause is None:
-                # empty block here
-
-                pass
-            else:
-                #
-                pass
-            if_stmt = statements[start]
-            if_body = if_stmt.if_branch
-            else_body = if_stmt.else_branch
-            if_exit_block = build_graph_recursive(if_body, builder, block, predicate)
-            # patch initial entry point
-            if_entry_block, = builder.graph.successors(block)
-            if if_exit_block.unterminated:
-                branch_exit_points.append(if_exit_block)
-            else_exit_block = build_graph_recursive(else_body, builder, block, predicate)
-            for s in builder.graph.successors(block):
-                assert isinstance(s, BasicBlock)
-                if s is not if_entry_block:
-                    break
-            else:
-                msg = f'No else entry block found for {statements[start]}'
-                raise ValueError(msg)
-            if else_exit_block.unterminated:
-                branch_exit_points.append(else_exit_block)
-            deferrals.append(branch_exit_points)
-        elif block.is_terminated:
-            builder.register_block_terminator(block)
-        prior_block = block
-    return prior_block
+        stats = node.body.stats
+    return reversed(stats) if reverse else iter(stats)
 
 
 def remove_trivial_empty_blocks(graph: FlowGraph):
@@ -470,34 +483,6 @@ def remove_trivial_empty_blocks(graph: FlowGraph):
             successor, = graph.successors(node)
             graph.graph.remove_node(node)
             graph.graph.add_edge(predecessor, successor)
-
-
-def build_graph(entry_point: nodes.ParallelRangeNode) -> FlowGraph:
-    """
-    This will construct a graph for a function or for loop. It will fail if continue or break appears here with respect
-    to a loop that is not included in the graph.
-    :param entry_point:
-    :return:
-    """
-    builder = CFGBuilder()
-    builder.insert_entry_block(entry_point)
-
-    build_graph_recursive(entry_point.body.stats, builder, builder.entry_block, None)
-
-    # Now clean up the graph
-    for loop_header, continue_blocks in builder.continue_map.items():
-        for block in continue_blocks:
-            builder.add_edge(block, loop_header)
-
-    for loop_header, break_blocks in builder.break_map.items():
-        loop_exit_block = builder.scope_exit_blocks[loop_header]
-        for block in break_blocks:
-            builder.add_edge(block, loop_exit_block)
-
-    graph = builder.graph
-    remove_trivial_empty_blocks(graph)
-
-    return graph
 
 
 
