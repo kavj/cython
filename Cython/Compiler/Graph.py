@@ -157,13 +157,13 @@ class BasicBlock:
         return isinstance(self.first, nodes.IfStatNode)
 
     @property
-    def is_terminated(self):
+    def terminated(self):
         # TODO: does cython allow return in parallel blocks?
         return isinstance(self.last, (nodes.BreakStatNode, nodes.ContinueStatNode, nodes.ReturnStatNode))
 
     @property
     def unterminated(self):
-        return not self.is_terminated
+        return not self.terminated
 
     @property
     def is_entry_point(self):
@@ -194,6 +194,12 @@ class BasicBlock:
             return f'block {self.label} {self.depth} {str(self.first)}'
         else:
             return f'block {self.label} {self.depth}'
+
+
+@dataclass
+class loop_context:
+    header: BasicBlock
+    exit_block: BasicBlock
 
 
 class FlowGraph:
@@ -249,7 +255,7 @@ class FlowGraph:
         self.graph.remove_edge(source, sink)
 
 
-class CFGBuilderVisitor(TreeVisitor):
+class CFGBuilder(TreeVisitor):
     def __init__(self, start_from=0):
         super().__init__()
         self.entry_points = []
@@ -267,22 +273,23 @@ class CFGBuilderVisitor(TreeVisitor):
     def next_label(self):
         return next(self.counter)
 
-    def enter_loop(self, block: BasicBlock):
-        assert block.is_loop_block
-        self.loop_depth += 1
-        self.entry_points.append((block,[]))
-
-    def exit_loop(self):
-        block, deferrals = self.entry_points.pop()
-        assert block.is_loop_block
-        self.loop_depth -= 1
-        return block, deferrals
-
     @contextmanager
     def branch_scope(self, block: BasicBlock):
         self.entry_points.append(block)
         yield
         self.entry_points.pop()
+
+    def handle_loop(self, node: Union[nodes.ParallelRangeNode, nodes.LoopNode]):
+        header_block = self.add_block(node)
+        exit_block = BasicBlock(self.next_label, self.loop_depth)
+        self.graph.add_edge(header_block, exit_block)
+        context = loop_context(header_block, exit_block)
+        self.entry_points.append(context)
+        self.loop_depth += 1
+        self.visit(node.body)
+        if not self.current_block.terminated:
+            # make back edge
+            self.graph.add_edge(self.current_block, header_block)
 
     def add_block(self, node: Optional[nodes.StatNode] = None, predicate: Optional[exprs.AtomicExprNode] = None):
         block = BasicBlock(self.next_label, self.loop_depth, predicate=predicate)
@@ -297,18 +304,7 @@ class CFGBuilderVisitor(TreeVisitor):
         return block
 
     def visit_ParallelRangeNode(self, node: nodes.ParallelRangeNode):
-        header_block = self.add_block(node)
-        self.enter_loop(header_block)
-        self.visit(node.body)
-        if not self.current_block.terminated:
-            # make back edge
-            self.graph.add_edge(self.current_block, header_block)
-        header, deferrals = self.exit_loop()
-        assert header is header_block
-        exit_block = self.add_block()
-        self.graph.add_edge(header_block, exit_block)
-        for d in deferrals:
-            self.graph.add_edge(d, exit_block)
+        self.handle_loop(node)
 
     def visit_IfStatNode(self, node: nodes.IfStatNode):
         header_block = self.add_block(node)
@@ -331,106 +327,23 @@ class CFGBuilderVisitor(TreeVisitor):
         self.add_block(predicate=node.condition)
         self.visit(node.body)
 
-    def visit_ForInStatNode(self):
-        header_block = self.add_block()
-        pass
+    def visit_ForInStatNode(self, node: nodes.ForInStatNode):
+        self.handle_loop(node)
 
-    def visit_WhileStatNode(self):
-        pass
+    def visit_WhileStatNode(self, node: nodes.WhileStatNode):
+        self.handle_loop(node)
 
-    def visit_BreakStatNode(self):
-        pass
+    def visit_BreakStatNode(self, node: nodes.BreakStatNode):
+        self.current_block.append(node)
+        self.graph.add_edge(self.current_block, self.entry_points[-1].exit_block)
 
-    def visit_ReturnStatNode(self):
-        pass
+    def visit_StatNode(self, node: nodes.StatNode):
+        if not self.current_block.terminated:
+            self.current_block.append(node)
 
-    def visit_StatNode(self):
-        pass
-
-    def visit_StatListNode(self):
-        pass
-
-
-
-class CFGBuilder:
-
-    def __init__(self, start_from=0):
-        self.entry_points = []
-        # self.pending_break_targets = []
-        self.labeler = itertools.count(start_from)
-        self.graph = None
-        self.counter = itertools.count()
-        self.current_block = None
-        self.loop_depth = 0
-
-    @property
-    def entry_block(self):
-        return self.graph.entry_block
-
-    @property
-    def next_label(self):
-        return next(self.counter)
-
-    def add_continue(self):
-        for block, _ in reversed(self.entry_points):
-            if block.is_loop_block:
-                self.add_edge(self.current_block, block)
-                return
-
-    def add_break(self):
-        for block, deferrals in reversed(self.entry_points):
-            if block.is_loop_block:
-                deferrals.append(self.current_block)
-                return
-
-    def add_branch_deferral(self, block: BasicBlock):
-        entry_point, deferrals = self.entry_points[-1]
-        assert entry_point.is_branch_block
-        deferrals.append(block)
-
-    def leave_scope(self):
-        block, deferrals = self.entry_points.pop()
-        current_block = self.current_block
-        assert block.is_loop_block
-        if block.is_loop_block:
-            if current_block.unterminated:
-                self.add_edge(current_block, block)
-            self.loop_depth -= 1
-        # declares break targets as parents of exit
-        self.create_block(predicate=True, parents=deferrals)
-
-    def create_block(self, predicate: Union[exprs.AtomicExprNode, bool], parents: List[BasicBlock]):
-        if predicate is None:
-            predicate = True
-        block = BasicBlock(self.next_label, self.loop_depth, predicate)
-        self.graph.graph.add_node(block)
-        for p in parents:
-            self.add_edge(p, block)
-        self.current_block = block
-        return block
-
-    def add_statement(self, stmt: nodes.StatNode):
-        if not self.current_block.is_terminated:
-            self.current_block.append(stmt)
-            if isinstance(stmt, nodes.ContinueStatNode):
-                self.add_continue()
-            elif isinstance(stmt, nodes.BreakStatNode):
-                self.add_break()
-
-    def add_entry_block(self, entry_stmt: Union[nodes.ParallelRangeNode, nodes.ForInStatNode, nodes.IfStatNode, nodes.WhileStatNode], parents: List[BasicBlock]):
-        block = self.create_block(predicate=True, parents=parents)
-        block.append(entry_stmt)
-        self.entry_points.append((block, []))
-        if block.is_loop_block:
-            self.loop_depth += 1
-        self.graph.entry_block = block
-
-    def add_edge(self, source: BasicBlock, sink: BasicBlock):
-        if not isinstance(source, BasicBlock) or not isinstance(sink, BasicBlock):
-            msg = f'Expected BasicBlock type for edge endpoints. Received "{source}" and "{sink}"'
-            raise ValueError(msg)
-        assert source is not sink
-        self.graph.graph.add_edge(source, sink)
+    def visit_StatListNode(self, node: nodes.StatListNode):
+        for stmt in node.stats:
+            self.visit(stmt)
 
 
 def matches_while_true(node: nodes.StatNode):
@@ -536,7 +449,7 @@ class OuterParallelGather(TreeVisitor):
     """
 
     def __init__(self):
-        super(OuterParallelGather, self).__init__()
+        super().__init__()
         self.parallel_nodes = []
 
     def visit_Node(self, node):
@@ -549,7 +462,7 @@ class OuterParallelGather(TreeVisitor):
 
 class SubgraphCreation(TreeVisitor):
     def __init__(self):
-        super(SubgraphCreation, self).__init__()
+        super().__init__()
 
     def __call__(self, entry):
         if isinstance(entry, nodes.ParallelRangeNode):
@@ -559,7 +472,9 @@ class SubgraphCreation(TreeVisitor):
             parallel_gather.visit(entry)
             parallel_entry_points = parallel_gather.parallel_nodes.copy()
             # make toy graph to start..
-            if parallel_entry_points:
-                graph = build_graph(parallel_entry_points[0])
+            if len(parallel_entry_points) == 1:
+                builder = CFGBuilder()
+                builder.visit(parallel_entry_points[0])
+                graph = builder.graph
                 render_dot_graph(graph.graph, 'test_graph_conversion.dot', Path.cwd())
         return entry
